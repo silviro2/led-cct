@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b0d10">
+<title>LED CCT</title>
+<style>
+  :root { --bg:#0b0d10; --card:#161a20; --line:#262c35; --txt:#eef1f5; --mut:#8b95a3; --acc:#ffb547; --ok:#4ade80; --warn:#f87171; }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  body { margin:0; background:var(--bg); color:var(--txt); font:16px/1.4 system-ui,-apple-system,Roboto,sans-serif; padding:env(safe-area-inset-top) 12px calc(env(safe-area-inset-bottom) + 16px); }
+  h1 { font-size:18px; margin:14px 0 10px; font-weight:600; }
+  .cam { position:relative; border-radius:16px; overflow:hidden; background:#000; aspect-ratio:3/4; max-height:48vh; width:100%; }
+  video { width:100%; height:100%; object-fit:cover; display:block; }
+  .reticle { position:absolute; left:50%; top:50%; width:22%; aspect-ratio:1; transform:translate(-50%,-50%); border:2px solid #fff; border-radius:6px; box-shadow:0 0 0 9999px rgba(0,0,0,.35); }
+  .panel { background:var(--card); border:1px solid var(--line); border-radius:16px; padding:14px; margin-top:12px; }
+  .big { font-size:56px; font-weight:700; text-align:center; letter-spacing:-1px; line-height:1.1; }
+  .big small { font-size:24px; color:var(--mut); font-weight:500; }
+  .sub { text-align:center; color:var(--mut); font-size:14px; margin-top:4px; min-height:20px; }
+  .sub.warn { color:var(--warn); } .sub.ok { color:var(--ok); }
+  .sw { height:34px; border-radius:8px; margin-top:10px; border:1px solid var(--line); }
+  .row { display:flex; gap:8px; margin-top:10px; flex-wrap:wrap; }
+  button { flex:1; min-width:30%; background:#222831; color:var(--txt); border:1px solid var(--line); border-radius:12px; padding:13px 8px; font-size:15px; font-weight:600; }
+  button:active { background:#2d343f; } button.pri { background:var(--acc); color:#1a1200; border-color:var(--acc); }
+  h2 { font-size:14px; margin:0 0 8px; color:var(--mut); text-transform:uppercase; letter-spacing:.06em; font-weight:600; }
+  table { width:100%; border-collapse:collapse; font-size:14px; }
+  td,th { padding:8px 4px; border-bottom:1px solid var(--line); text-align:left; }
+  th { color:var(--mut); font-weight:500; font-size:12px; }
+  tr.ref { cursor:pointer; } tr.ref:active { background:#222831; }
+  .dot { display:inline-block; width:12px; height:12px; border-radius:50%; vertical-align:-1px; margin-right:6px; border:1px solid var(--line); }
+  .note { color:var(--mut); font-size:13px; margin-top:8px; }
+  .hint { font-size:13px; color:var(--mut); }
+</style>
+</head>
+<body>
+<h1>LED CCT · temperatura colore</h1>
+
+<div class="cam">
+  <video id="video" autoplay playsinline muted></video>
+  <div class="reticle"></div>
+</div>
+
+<div class="panel">
+  <div class="big"><span id="k">--</span> <small>K</small></div>
+  <div class="sub" id="status">Avvio fotocamera…</div>
+  <div class="sw" id="sw"></div>
+  <div class="row">
+    <button class="pri" id="btnSave">Salva misura</button>
+    <button id="btnFreeze">Blocca</button>
+    <button id="btnCal">Calibra</button>
+  </div>
+  <div class="hint" style="margin-top:10px" id="calInfo"></div>
+</div>
+
+<div class="panel">
+  <h2>Riferimenti (tocca per calibrare)</h2>
+  <table id="refs"></table>
+  <div class="note">Inquadra una sorgente di cui conosci i K reali, poi tocca la riga corrispondente: la lettura viene allineata a quel valore.</div>
+</div>
+
+<div class="panel">
+  <h2>Misure salvate</h2>
+  <table id="hist"><tr><td class="hint">Nessuna misura salvata.</td></tr></table>
+  <div class="row">
+    <button id="btnCsv">Esporta CSV</button>
+    <button id="btnClear">Svuota</button>
+  </div>
+</div>
+
+<div class="panel hint">
+  Per misure attendibili non inquadrare direttamente il LED: illumina un foglio bianco opaco o un cartoncino grigio neutro e inquadra quello, tenendo il mirino al centro. Evita luci miste (finestre, altre lampade). Precisione indicativa: qualche centinaio di K; utile per confrontare strip e lampade tra loro.
+</div>
+
+<canvas id="cv" width="48" height="48" hidden></canvas>
+
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const video = $('video'), cv = $('cv'), ctx = cv.getContext('2d', { willReadFrequently: true });
+  const store = {
+    get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } },
+    set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} }
+  };
+
+  let offsetMired = store.get('offset', 0);
+  let history = store.get('hist', []);
+  let lastRawMired = 0, smooth = 0, frozen = false, current = null;
+
+  const REFS = [
+    { k: 1900, n: 'Candela',             c: '#ff9d3c' },
+    { k: 2700, n: 'Bianco caldo',        c: '#ffb86b' },
+    { k: 3000, n: 'Bianco caldo (3000)', c: '#ffc98e' },
+    { k: 4000, n: 'Bianco neutro',       c: '#ffe0b8' },
+    { k: 5000, n: 'Luce diurna',         c: '#fff1e0' },
+    { k: 6500, n: 'Bianco freddo',       c: '#f3f6ff' }
+  ];
+
+  /* ---------- conversione colore ---------- */
+  const lin = c => { const v = c / 255; return v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4); };
+  function cctFromRgb(r8, g8, b8) {
+    const r = lin(r8), g = lin(g8), b = lin(b8);
+    const X = 0.4124564 * r + 0.3575761 * g + 0.1804375 * b;
+    const Y = 0.2126729 * r + 0.7151522 * g + 0.0721750 * b;
+    const Z = 0.0193339 * r + 0.1191920 * g + 0.9503041 * b;
+    const s = X + Y + Z; if (s <= 0) return NaN;
+    const x = X / s, y = Y / s;
+    const n = (x - 0.3320) / (0.1858 - y);              // formula di McCamy
+    return 449 * n ** 3 + 3525 * n ** 2 + 6823.3 * n + 5520.33;
+  }
+
+  /* ---------- fotocamera ---------- */
+  async function startCam() {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      setStatus('Fotocamera non disponibile: apri il file con Chrome o da un indirizzo https.', 'warn'); return;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false
+      });
+      video.srcObject = stream;
+      const track = stream.getVideoTracks()[0];
+      await lockCamera(track);
+      requestAnimationFrame(loop);
+    } catch (e) {
+      setStatus('Permesso fotocamera negato o non disponibile (' + (e.name || 'errore') + ').', 'warn');
+    }
+  }
+
+  async function lockCamera(track) {
+    const caps = (track.getCapabilities && track.getCapabilities()) || {};
+    let wb = false;
+    try {
+      if (caps.whiteBalanceMode && caps.whiteBalanceMode.includes('manual')) {
+        const adv = { whiteBalanceMode: 'manual' };
+        if (caps.colorTemperature) adv.colorTemperature = 5000;   // valore fisso, indipendente dalla scena
+        await track.applyConstraints({ advanced: [adv] });
+        wb = true;
+      }
+    } catch (e) {}
+    try {
+      if (caps.exposureCompensation) {
+        await track.applyConstraints({ advanced: [{ exposureCompensation: caps.exposureCompensation.min * 0.5 }] });
+      }
+    } catch (e) {}
+    $('calInfo').textContent = wb
+      ? 'Bilanciamento del bianco bloccato: OK.'
+      : 'Questo browser non permette di bloccare il bilanciamento del bianco: la misura sarà meno stabile. Usa Calibra con una sorgente nota.';
+    updateCalInfo(wb);
+  }
+
+  function updateCalInfo(wb) {
+    const base = $('calInfo').textContent.split(' · ')[0];
+    $('calInfo').textContent = base + ' · Calibrazione: ' + (offsetMired ? (offsetMired > 0 ? '+' : '') + offsetMired.toFixed(1) + ' mired' : 'nessuna');
+  }
+
+  /* ---------- ciclo di misura ---------- */
+  let lastT = 0;
+  function loop(t) {
+    requestAnimationFrame(loop);
+    if (t - lastT < 100 || frozen || video.readyState < 2) return;   // ~10 misure/s
+    lastT = t;
+    const vw = video.videoWidth, vh = video.videoHeight; if (!vw) return;
+    const side = Math.min(vw, vh) * 0.22;
+    ctx.drawImage(video, (vw - side) / 2, (vh - side) / 2, side, side, 0, 0, 48, 48);
+    const d = ctx.getImageData(0, 0, 48, 48).data;
+    let r = 0, g = 0, b = 0, n = 0, mx = 0;
+    for (let i = 0; i < d.length; i += 4) {
+      r += d[i]; g += d[i + 1]; b += d[i + 2]; n++;
+      mx = Math.max(mx, d[i], d[i + 1], d[i + 2]);
+    }
+    r /= n; g /= n; b /= n;
+    const cct = cctFromRgb(r, g, b); if (!isFinite(cct) || cct <= 0) return;
+    lastRawMired = 1e6 / cct;
+    const mired = lastRawMired + offsetMired;
+    smooth = smooth ? smooth * 0.8 + mired * 0.2 : mired;
+    const K = Math.round(1e6 / smooth / 10) * 10;
+    current = { K, r: Math.round(r), g: Math.round(g), b: Math.round(b) };
+    $('k').textContent = K;
+    $('sw').style.background = `rgb(${current.r},${current.g},${current.b})`;
+    if (mx >= 250) setStatus('⚠ Saturazione: allontanati o interponi un foglio bianco', 'warn');
+    else if (mx < 40) setStatus('Segnale troppo basso: avvicinati alla sorgente', 'warn');
+    else setStatus(`RGB ${current.r}, ${current.g}, ${current.b} · misura OK`, 'ok');
+  }
+  function setStatus(t, cls) { const s = $('status'); s.textContent = t; s.className = 'sub ' + (cls || ''); }
+
+  /* ---------- calibrazione ---------- */
+  function calibrateTo(target) {
+    if (!lastRawMired || !(target >= 1500 && target <= 12000)) return;
+    offsetMired = 1e6 / target - lastRawMired; smooth = 0;
+    store.set('offset', offsetMired); updateCalInfo();
+  }
+  $('btnCal').onclick = () => {
+    const v = prompt('Temperatura reale della sorgente inquadrata (K). Lascia vuoto o 0 per azzerare:', '3000');
+    if (v === null) return;
+    const t = parseFloat(v);
+    if (!t) { offsetMired = 0; smooth = 0; store.set('offset', 0); updateCalInfo(); }
+    else calibrateTo(t);
+  };
+
+  /* ---------- tabella riferimenti ---------- */
+  $('refs').innerHTML = '<tr><th>Sorgente</th><th>K</th></tr>' + REFS.map(r =>
+    `<tr class="ref" data-k="${r.k}"><td><span class="dot" style="background:${r.c}"></span>${r.n}</td><td>${r.k}</td></tr>`).join('');
+  $('refs').addEventListener('click', e => {
+    const tr = e.target.closest('tr.ref'); if (!tr) return;
+    if (confirm('Calibrare la lettura attuale a ' + tr.dataset.k + ' K?')) calibrateTo(+tr.dataset.k);
+  });
+
+  /* ---------- salvataggio / CSV ---------- */
+  $('btnFreeze').onclick = e => { frozen = !frozen; e.target.textContent = frozen ? 'Sblocca' : 'Blocca'; };
+  $('btnSave').onclick = () => {
+    if (!current) return;
+    const note = prompt('Nota (es. nome lampada / strip):', '') || '';
+    history.unshift({ t: new Date().toISOString(), ...current, note });
+    store.set('hist', history); renderHist();
+  };
+  $('btnClear').onclick = () => { if (confirm('Cancellare tutte le misure salvate?')) { history = []; store.set('hist', history); renderHist(); } };
+  $('btnCsv').onclick = () => {
+    if (!history.length) return;
+    const esc = s => '"' + String(s).replace(/"/g, '""') + '"';
+    const rows = ['data_ora;kelvin;R;G;B;nota'].concat(history.map(h =>
+      [new Date(h.t).toLocaleString('it-IT'), h.K, h.r, h.g, h.b, esc(h.note)].join(';')));
+    const blob = new Blob(['\ufeff' + rows.join('\n')], { type: 'text/csv;charset=utf-8' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob); a.download = 'misure-led-cct.csv';
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+  };
+  function renderHist() {
+    $('hist').innerHTML = history.length
+      ? '<tr><th>Ora</th><th>K</th><th>Nota</th></tr>' + history.slice(0, 50).map(h =>
+          `<tr><td>${new Date(h.t).toLocaleTimeString('it-IT', { hour: '2-digit', minute: '2-digit' })}</td><td><span class="dot" style="background:rgb(${h.r},${h.g},${h.b})"></span>${h.K}</td><td>${h.note.replace(/</g, '&lt;')}</td></tr>`).join('')
+      : '<tr><td class="hint">Nessuna misura salvata.</td></tr>';
+  }
+  renderHist(); updateCalInfo();
+  startCam();
+})();
+</script>
+</body>
+</html>
